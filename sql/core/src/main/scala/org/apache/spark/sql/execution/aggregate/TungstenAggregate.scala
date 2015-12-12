@@ -20,20 +20,37 @@ package org.apache.spark.sql.execution.aggregate
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.errors._
-import org.apache.spark.sql.catalyst.expressions.aggregate.AggregateExpression2
 import org.apache.spark.sql.catalyst.expressions._
-import org.apache.spark.sql.catalyst.plans.physical.{UnspecifiedDistribution, ClusteredDistribution, AllTuples, Distribution}
-import org.apache.spark.sql.execution.{UnaryNode, SparkPlan}
+import org.apache.spark.sql.catalyst.expressions.aggregate.AggregateExpression
+import org.apache.spark.sql.catalyst.plans.physical._
+import org.apache.spark.sql.execution.metric.SQLMetrics
+import org.apache.spark.sql.execution.{SparkPlan, UnaryNode, UnsafeFixedWidthAggregationMap}
+import org.apache.spark.sql.types.StructType
 
 case class TungstenAggregate(
     requiredChildDistributionExpressions: Option[Seq[Expression]],
     groupingExpressions: Seq[NamedExpression],
-    nonCompleteAggregateExpressions: Seq[AggregateExpression2],
-    completeAggregateExpressions: Seq[AggregateExpression2],
+    nonCompleteAggregateExpressions: Seq[AggregateExpression],
+    nonCompleteAggregateAttributes: Seq[Attribute],
+    completeAggregateExpressions: Seq[AggregateExpression],
+    completeAggregateAttributes: Seq[Attribute],
     initialInputBufferOffset: Int,
     resultExpressions: Seq[NamedExpression],
     child: SparkPlan)
   extends UnaryNode {
+
+  private[this] val aggregateBufferAttributes = {
+    (nonCompleteAggregateExpressions ++ completeAggregateExpressions)
+      .flatMap(_.aggregateFunction.aggBufferAttributes)
+  }
+
+  require(TungstenAggregate.supportsAggregate(groupingExpressions, aggregateBufferAttributes))
+
+  override private[sql] lazy val metrics = Map(
+    "numInputRows" -> SQLMetrics.createLongMetric(sparkContext, "number of input rows"),
+    "numOutputRows" -> SQLMetrics.createLongMetric(sparkContext, "number of output rows"),
+    "dataSize" -> SQLMetrics.createSizeMetric(sparkContext, "data size"),
+    "spillSize" -> SQLMetrics.createSizeMetric(sparkContext, "spill size"))
 
   override def outputsUnsafeRows: Boolean = true
 
@@ -61,26 +78,38 @@ case class TungstenAggregate(
   }
 
   protected override def doExecute(): RDD[InternalRow] = attachTree(this, "execute") {
+    val numInputRows = longMetric("numInputRows")
+    val numOutputRows = longMetric("numOutputRows")
+    val dataSize = longMetric("dataSize")
+    val spillSize = longMetric("spillSize")
+
     child.execute().mapPartitions { iter =>
+
       val hasInput = iter.hasNext
       if (!hasInput && groupingExpressions.nonEmpty) {
         // This is a grouped aggregate and the input iterator is empty,
         // so return an empty iterator.
-        Iterator.empty.asInstanceOf[Iterator[UnsafeRow]]
+        Iterator.empty
       } else {
         val aggregationIterator =
           new TungstenAggregationIterator(
             groupingExpressions,
             nonCompleteAggregateExpressions,
+            nonCompleteAggregateAttributes,
             completeAggregateExpressions,
+            completeAggregateAttributes,
             initialInputBufferOffset,
             resultExpressions,
             newMutableProjection,
             child.output,
             iter,
-            testFallbackStartsAt)
-
+            testFallbackStartsAt,
+            numInputRows,
+            numOutputRows,
+            dataSize,
+            spillSize)
         if (!hasInput && groupingExpressions.isEmpty) {
+          numOutputRows += 1
           Iterator.single[UnsafeRow](aggregationIterator.outputForEmptyGroupingKeyWithoutInput())
         } else {
           aggregationIterator
@@ -95,11 +124,21 @@ case class TungstenAggregate(
     testFallbackStartsAt match {
       case None =>
         val keyString = groupingExpressions.mkString("[", ",", "]")
-        val valueString = allAggregateExpressions.mkString("[", ",", "]")
-        s"TungstenAggregate(key=$keyString, value=$valueString"
+        val functionString = allAggregateExpressions.mkString("[", ",", "]")
+        val outputString = output.mkString("[", ",", "]")
+        s"TungstenAggregate(key=$keyString, functions=$functionString, output=$outputString)"
       case Some(fallbackStartsAt) =>
         s"TungstenAggregateWithControlledFallback $groupingExpressions " +
-          s"$allAggregateExpressions fallbackStartsAt=$fallbackStartsAt"
+          s"$allAggregateExpressions $resultExpressions fallbackStartsAt=$fallbackStartsAt"
     }
+  }
+}
+
+object TungstenAggregate {
+  def supportsAggregate(
+    groupingExpressions: Seq[Expression],
+    aggregateBufferAttributes: Seq[Attribute]): Boolean = {
+    val aggregationBufferSchema = StructType.fromAttributes(aggregateBufferAttributes)
+    UnsafeFixedWidthAggregationMap.supportsAggregationBufferSchema(aggregationBufferSchema)
   }
 }

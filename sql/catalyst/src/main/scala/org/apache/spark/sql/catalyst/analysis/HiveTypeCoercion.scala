@@ -20,6 +20,7 @@ package org.apache.spark.sql.catalyst.analysis
 import javax.annotation.Nullable
 
 import org.apache.spark.sql.catalyst.expressions._
+import org.apache.spark.sql.catalyst.expressions.aggregate._
 import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.types._
@@ -164,7 +165,7 @@ object HiveTypeCoercion {
               // Leave the same if the dataTypes match.
               case Some(newType) if a.dataType == newType.dataType => a
               case Some(newType) =>
-                logDebug(s"Promoting $a to $newType in ${q.simpleString}}")
+                logDebug(s"Promoting $a to $newType in ${q.simpleString}")
                 newType
             }
         }
@@ -203,6 +204,7 @@ object HiveTypeCoercion {
         planName: String,
         left: LogicalPlan,
         right: LogicalPlan): (LogicalPlan, LogicalPlan) = {
+      require(left.output.length == right.output.length)
 
       val castedTypes = left.output.zip(right.output).map {
         case (lhs, rhs) if lhs.dataType != rhs.dataType =>
@@ -229,15 +231,10 @@ object HiveTypeCoercion {
     def apply(plan: LogicalPlan): LogicalPlan = plan resolveOperators {
       case p if p.analyzed => p
 
-      case u @ Union(left, right) if u.childrenResolved && !u.resolved =>
-        val (newLeft, newRight) = widenOutputTypes(u.nodeName, left, right)
-        Union(newLeft, newRight)
-      case e @ Except(left, right) if e.childrenResolved && !e.resolved =>
-        val (newLeft, newRight) = widenOutputTypes(e.nodeName, left, right)
-        Except(newLeft, newRight)
-      case i @ Intersect(left, right) if i.childrenResolved && !i.resolved =>
-        val (newLeft, newRight) = widenOutputTypes(i.nodeName, left, right)
-        Intersect(newLeft, newRight)
+      case s @ SetOperation(left, right) if s.childrenResolved
+          && left.output.length == right.output.length && !s.resolved =>
+        val (newLeft, newRight) = widenOutputTypes(s.nodeName, left, right)
+        s.makeCopy(Array(newLeft, newRight))
     }
   }
 
@@ -284,6 +281,12 @@ object HiveTypeCoercion {
       case p @ BinaryComparison(left @ DateType(), right @ TimestampType()) =>
         p.makeCopy(Array(Cast(left, StringType), Cast(right, StringType)))
 
+      // Checking NullType
+      case p @ BinaryComparison(left @ StringType(), right @ NullType()) =>
+        p.makeCopy(Array(left, Literal.create(null, StringType)))
+      case p @ BinaryComparison(left @ NullType(), right @ StringType()) =>
+        p.makeCopy(Array(Literal.create(null, StringType), right))
+
       case p @ BinaryComparison(left @ StringType(), right) if right.dataType != StringType =>
         p.makeCopy(Array(Cast(left, DoubleType), right))
       case p @ BinaryComparison(left, right @ StringType()) if left.dataType != StringType =>
@@ -299,13 +302,28 @@ object HiveTypeCoercion {
         i.makeCopy(Array(Cast(a, StringType), b.map(Cast(_, StringType))))
 
       case Sum(e @ StringType()) => Sum(Cast(e, DoubleType))
-      case SumDistinct(e @ StringType()) => Sum(Cast(e, DoubleType))
       case Average(e @ StringType()) => Average(Cast(e, DoubleType))
+      case StddevPop(e @ StringType(), mutableAggBufferOffset, inputAggBufferOffset) =>
+        StddevPop(Cast(e, DoubleType), mutableAggBufferOffset, inputAggBufferOffset)
+      case StddevSamp(e @ StringType(), mutableAggBufferOffset, inputAggBufferOffset) =>
+        StddevSamp(Cast(e, DoubleType), mutableAggBufferOffset, inputAggBufferOffset)
+      case VariancePop(e @ StringType(), mutableAggBufferOffset, inputAggBufferOffset) =>
+        VariancePop(Cast(e, DoubleType), mutableAggBufferOffset, inputAggBufferOffset)
+      case VarianceSamp(e @ StringType(), mutableAggBufferOffset, inputAggBufferOffset) =>
+        VarianceSamp(Cast(e, DoubleType), mutableAggBufferOffset, inputAggBufferOffset)
+      case Skewness(e @ StringType(), mutableAggBufferOffset, inputAggBufferOffset) =>
+        Skewness(Cast(e, DoubleType), mutableAggBufferOffset, inputAggBufferOffset)
+      case Kurtosis(e @ StringType(), mutableAggBufferOffset, inputAggBufferOffset) =>
+        Kurtosis(Cast(e, DoubleType), mutableAggBufferOffset, inputAggBufferOffset)
     }
   }
 
   /**
-   * Convert all expressions in in() list to the left operator type
+   * Convert the value and in list expressions to the common operator type
+   * by looking at all the argument types and finding the closest one that
+   * all the arguments can be cast to. When no common operator type is found
+   * the original expression will be returned and an Analysis Exception will
+   * be raised at type checking phase.
    */
   object InConversion extends Rule[LogicalPlan] {
     def apply(plan: LogicalPlan): LogicalPlan = plan resolveExpressions {
@@ -313,7 +331,10 @@ object HiveTypeCoercion {
       case e if !e.childrenResolved => e
 
       case i @ In(a, b) if b.exists(_.dataType != a.dataType) =>
-        i.makeCopy(Array(a, b.map(Cast(_, a.dataType))))
+        findWiderCommonType(i.children.map(_.dataType)) match {
+          case Some(finalDataType) => i.withNewChildren(i.children.map(Cast(_, finalDataType)))
+          case None => i
+        }
     }
   }
 
@@ -371,8 +392,8 @@ object HiveTypeCoercion {
       DecimalType.bounded(range + scale, scale)
     }
 
-    private def changePrecision(e: Expression, dataType: DataType): Expression = {
-      ChangeDecimalPrecision(Cast(e, dataType))
+    private def promotePrecision(e: Expression, dataType: DataType): Expression = {
+      PromotePrecision(Cast(e, dataType))
     }
 
     def apply(plan: LogicalPlan): LogicalPlan = plan resolveOperators {
@@ -383,36 +404,48 @@ object HiveTypeCoercion {
         case e if !e.childrenResolved => e
 
         // Skip nodes who is already promoted
-        case e: BinaryArithmetic if e.left.isInstanceOf[ChangeDecimalPrecision] => e
+        case e: BinaryArithmetic if e.left.isInstanceOf[PromotePrecision] => e
 
         case Add(e1 @ DecimalType.Expression(p1, s1), e2 @ DecimalType.Expression(p2, s2)) =>
           val dt = DecimalType.bounded(max(s1, s2) + max(p1 - s1, p2 - s2) + 1, max(s1, s2))
-          Add(changePrecision(e1, dt), changePrecision(e2, dt))
+          CheckOverflow(Add(promotePrecision(e1, dt), promotePrecision(e2, dt)), dt)
 
         case Subtract(e1 @ DecimalType.Expression(p1, s1), e2 @ DecimalType.Expression(p2, s2)) =>
           val dt = DecimalType.bounded(max(s1, s2) + max(p1 - s1, p2 - s2) + 1, max(s1, s2))
-          Subtract(changePrecision(e1, dt), changePrecision(e2, dt))
+          CheckOverflow(Subtract(promotePrecision(e1, dt), promotePrecision(e2, dt)), dt)
 
         case Multiply(e1 @ DecimalType.Expression(p1, s1), e2 @ DecimalType.Expression(p2, s2)) =>
-          val dt = DecimalType.bounded(p1 + p2 + 1, s1 + s2)
-          Multiply(changePrecision(e1, dt), changePrecision(e2, dt))
+          val resultType = DecimalType.bounded(p1 + p2 + 1, s1 + s2)
+          val widerType = widerDecimalType(p1, s1, p2, s2)
+          CheckOverflow(Multiply(promotePrecision(e1, widerType), promotePrecision(e2, widerType)),
+            resultType)
 
         case Divide(e1 @ DecimalType.Expression(p1, s1), e2 @ DecimalType.Expression(p2, s2)) =>
-          val dt = DecimalType.bounded(p1 - s1 + s2 + max(6, s1 + p2 + 1), max(6, s1 + p2 + 1))
-          Divide(changePrecision(e1, dt), changePrecision(e2, dt))
+          var intDig = min(DecimalType.MAX_SCALE, p1 - s1 + s2)
+          var decDig = min(DecimalType.MAX_SCALE, max(6, s1 + p2 + 1))
+          val diff = (intDig + decDig) - DecimalType.MAX_SCALE
+          if (diff > 0) {
+            decDig -= diff / 2 + 1
+            intDig = DecimalType.MAX_SCALE - decDig
+          }
+          val resultType = DecimalType.bounded(intDig + decDig, decDig)
+          val widerType = widerDecimalType(p1, s1, p2, s2)
+          CheckOverflow(Divide(promotePrecision(e1, widerType), promotePrecision(e2, widerType)),
+            resultType)
 
         case Remainder(e1 @ DecimalType.Expression(p1, s1), e2 @ DecimalType.Expression(p2, s2)) =>
           val resultType = DecimalType.bounded(min(p1 - s1, p2 - s2) + max(s1, s2), max(s1, s2))
           // resultType may have lower precision, so we cast them into wider type first.
           val widerType = widerDecimalType(p1, s1, p2, s2)
-          Cast(Remainder(changePrecision(e1, widerType), changePrecision(e2, widerType)),
+          CheckOverflow(Remainder(promotePrecision(e1, widerType), promotePrecision(e2, widerType)),
             resultType)
 
         case Pmod(e1 @ DecimalType.Expression(p1, s1), e2 @ DecimalType.Expression(p2, s2)) =>
           val resultType = DecimalType.bounded(min(p1 - s1, p2 - s2) + max(s1, s2), max(s1, s2))
           // resultType may have lower precision, so we cast them into wider type first.
           val widerType = widerDecimalType(p1, s1, p2, s2)
-          Cast(Pmod(changePrecision(e1, widerType), changePrecision(e2, widerType)), resultType)
+          CheckOverflow(Pmod(promotePrecision(e1, widerType), promotePrecision(e2, widerType)),
+            resultType)
 
         case b @ BinaryComparison(e1 @ DecimalType.Expression(p1, s1),
                                   e2 @ DecimalType.Expression(p2, s2)) if p1 != p2 || s1 != s2 =>
@@ -541,12 +574,6 @@ object HiveTypeCoercion {
       case Sum(e @ IntegralType()) if e.dataType != LongType => Sum(Cast(e, LongType))
       case Sum(e @ FractionalType()) if e.dataType != DoubleType => Sum(Cast(e, DoubleType))
 
-      case s @ SumDistinct(e @ DecimalType()) => s // Decimal is already the biggest.
-      case SumDistinct(e @ IntegralType()) if e.dataType != LongType =>
-        SumDistinct(Cast(e, LongType))
-      case SumDistinct(e @ FractionalType()) if e.dataType != DoubleType =>
-        SumDistinct(Cast(e, DoubleType))
-
       case s @ Average(e @ DecimalType()) => s // Decimal is already the biggest.
       case Average(e @ IntegralType()) if e.dataType != LongType =>
         Average(Cast(e, LongType))
@@ -599,7 +626,7 @@ object HiveTypeCoercion {
     def apply(plan: LogicalPlan): LogicalPlan = plan resolveExpressions {
       case c: CaseWhenLike if c.childrenResolved && !c.valueTypesEqual =>
         logDebug(s"Input values for null casting ${c.valueTypes.mkString(",")}")
-        val maybeCommonType = findTightestCommonTypeAndPromoteToString(c.valueTypes)
+        val maybeCommonType = findWiderCommonType(c.valueTypes)
         maybeCommonType.map { commonType =>
           val castedBranches = c.branches.grouped(2).map {
             case Seq(when, value) if value.dataType != commonType =>
@@ -616,7 +643,7 @@ object HiveTypeCoercion {
 
       case c: CaseKeyWhen if c.childrenResolved && !c.resolved =>
         val maybeCommonType =
-          findTightestCommonTypeAndPromoteToString((c.key +: c.whenList).map(_.dataType))
+          findWiderCommonType((c.key +: c.whenList).map(_.dataType))
         maybeCommonType.map { commonType =>
           val castedBranches = c.branches.grouped(2).map {
             case Seq(whenExpr, thenExpr) if whenExpr.dataType != commonType =>
@@ -633,6 +660,7 @@ object HiveTypeCoercion {
    */
   object IfCoercion extends Rule[LogicalPlan] {
     def apply(plan: LogicalPlan): LogicalPlan = plan resolveExpressions {
+      case e if !e.childrenResolved => e
       // Find tightest common type for If, if the true value and false value have different types.
       case i @ If(pred, left, right) if left.dataType != right.dataType =>
         findTightestCommonTypeToString(left.dataType, right.dataType).map { widestType =>

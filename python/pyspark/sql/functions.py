@@ -24,12 +24,12 @@ import sys
 if sys.version < "3":
     from itertools import imap as map
 
-from pyspark import SparkContext
+from pyspark import since, SparkContext
 from pyspark.rdd import _prepare_for_python_RDD, ignore_unicode_prefix
 from pyspark.serializers import PickleSerializer, AutoBatchedSerializer
-from pyspark.sql import since
 from pyspark.sql.types import StringType
 from pyspark.sql.column import Column, _to_java_column, _to_seq
+from pyspark.sql.dataframe import DataFrame
 
 
 def _create_function(name, doc=""):
@@ -122,6 +122,24 @@ _functions_1_4 = {
     'bitwiseNOT': 'Computes bitwise not.',
 }
 
+_functions_1_6 = {
+    # unary math functions
+    'stddev': 'Aggregate function: returns the unbiased sample standard deviation of' +
+              ' the expression in a group.',
+    'stddev_samp': 'Aggregate function: returns the unbiased sample standard deviation of' +
+                   ' the expression in a group.',
+    'stddev_pop': 'Aggregate function: returns population standard deviation of' +
+                  ' the expression in a group.',
+    'variance': 'Aggregate function: returns the population variance of the values in a group.',
+    'var_samp': 'Aggregate function: returns the unbiased variance of the values in a group.',
+    'var_pop':  'Aggregate function: returns the population variance of the values in a group.',
+    'skewness': 'Aggregate function: returns the skewness of the values in a group.',
+    'kurtosis': 'Aggregate function: returns the kurtosis of the values in a group.',
+    'collect_list': 'Aggregate function: returns a list of objects with duplicates.',
+    'collect_set': 'Aggregate function: returns a set of objects with duplicate elements' +
+                   ' eliminated.'
+}
+
 # math functions that take two arguments as input
 _binary_mathfunctions = {
     'atan2': 'Returns the angle theta from the conversion of rectangular coordinates (x, y) to' +
@@ -172,6 +190,8 @@ for _name, _doc in _binary_mathfunctions.items():
     globals()[_name] = since(1.4)(_create_binary_mathfunction(_name, _doc))
 for _name, _doc in _window_functions.items():
     globals()[_name] = since(1.4)(_create_window_function(_name, _doc))
+for _name, _doc in _functions_1_6.items():
+    globals()[_name] = since(1.6)(_create_function(_name, _doc))
 del _name, _doc
 
 
@@ -188,6 +208,14 @@ def approxCountDistinct(col, rsd=None):
     else:
         jc = sc._jvm.functions.approxCountDistinct(_to_java_column(col), rsd)
     return Column(jc)
+
+
+@since(1.6)
+def broadcast(df):
+    """Marks a DataFrame as small enough for use in broadcast joins."""
+
+    sc = SparkContext._active_spark_context
+    return DataFrame(sc._jvm.functions.broadcast(df._jdf), df.sql_ctx)
 
 
 @since(1.4)
@@ -225,6 +253,22 @@ def coalesce(*cols):
     sc = SparkContext._active_spark_context
     jc = sc._jvm.functions.coalesce(_to_seq(sc, cols, _to_java_column))
     return Column(jc)
+
+
+@since(1.6)
+def corr(col1, col2):
+    """Returns a new :class:`Column` for the Pearson Correlation Coefficient for ``col1``
+    and ``col2``.
+
+    >>> a = [x * x - 2 * x + 3.5 for x in range(20)]
+    >>> b = range(20)
+    >>> corrDf = sqlContext.createDataFrame(zip(a, b))
+    >>> corrDf = corrDf.agg(corr(corrDf._1, corrDf._2).alias('c'))
+    >>> corrDf.selectExpr('abs(c - 0.9572339139475857) < 1e-16 as t').collect()
+    [Row(t=True)]
+    """
+    sc = SparkContext._active_spark_context
+    return Column(sc._jvm.functions.corr(_to_java_column(col1), _to_java_column(col2)))
 
 
 @since(1.3)
@@ -354,7 +398,7 @@ def expr(str):
     """Parses the expression string into the column that it represents
 
     >>> df.select(expr("length(name)")).collect()
-    [Row('length(name)=5), Row('length(name)=3)]
+    [Row(length(name)=5), Row(length(name)=3)]
     """
     sc = SparkContext._active_spark_context
     return Column(sc._jvm.functions.expr(str))
@@ -530,9 +574,10 @@ def lead(col, count=1, default=None):
 @since(1.4)
 def ntile(n):
     """
-    Window function: returns a group id from 1 to `n` (inclusive) in a round-robin fashion in
-    a window partition. Fow example, if `n` is 3, the first row will get 1, the second row will
-    get 2, the third row will get 3, and the fourth row will get 1...
+    Window function: returns the ntile group id (from 1 to `n` inclusive)
+    in an ordered window partition. For example, if `n` is 4, the first
+    quarter of the rows will get value 1, the second quarter will get 2,
+    the third quarter will get 3, and the last quarter will get 4.
 
     This is equivalent to the NTILE function in SQL.
 
@@ -885,10 +930,10 @@ def crc32(col):
     returns the value as a bigint.
 
     >>> sqlContext.createDataFrame([('ABC',)], ['a']).select(crc32('a').alias('crc32')).collect()
-    [Row(crc32=u'902fbdd2b1df0c4f70b4a5d23525e932')]
+    [Row(crc32=2743272264)]
     """
     sc = SparkContext._active_spark_context
-    return Column(sc._jvm.functions.md5(_to_java_column(col)))
+    return Column(sc._jvm.functions.crc32(_to_java_column(col)))
 
 
 @ignore_unicode_prefix
