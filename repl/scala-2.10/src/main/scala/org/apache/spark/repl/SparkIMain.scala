@@ -89,14 +89,15 @@ import org.apache.spark.annotation.DeveloperApi
   class SparkIMain(
       initialSettings: Settings,
       val out: JPrintWriter,
-      propagateExceptions: Boolean = false)
+      propagateExceptions: Boolean = false
+                    )
     extends SparkImports with Logging { imain =>
 
     private val conf = new SparkConf()
 
     private val SPARK_DEBUG_REPL: Boolean = (System.getenv("SPARK_DEBUG_REPL") == "1")
     /** Local directory to save .class files too */
-    private lazy val outputDir = {
+    private var outputDir = {
       val tmp = System.getProperty("java.io.tmpdir")
       val rootDir = conf.get("spark.repl.classdir",  tmp)
       Utils.createTempDir(rootDir)
@@ -114,8 +115,8 @@ import org.apache.spark.annotation.DeveloperApi
 
     private val virtualDirectory                              = new PlainFile(outputDir) // "directory" for classfiles
     /** Jetty server that will serve our classes to worker nodes */
-    private val classServerPort                               = conf.getInt("spark.replClassServer.port", 0)
-    private val classServer                                   = new HttpServer(conf, outputDir, new SecurityManager(conf), classServerPort, "HTTP class server")
+    private var classServerPort                               = conf.getInt("spark.replClassServer.port", 0)
+    private var classServer                                   = new HttpServer(conf, outputDir, new SecurityManager(conf), classServerPort, "HTTP class server")
     private var currentSettings: Settings             = initialSettings
     private var printResults                                  = true      // whether to print result lines
     private var totalSilence                                  = false     // whether to print anything
@@ -131,6 +132,31 @@ import org.apache.spark.annotation.DeveloperApi
     if (SPARK_DEBUG_REPL) {
       echo("Class server started, URI = " + classServer.uri)
     }
+
+    @DeveloperApi
+    def setClassServer(cs : HttpServer ) = {
+      echo ("Stoping classServer "+classServer.uri)
+      classServer.stop()
+
+      classServer=cs;
+      echo ("Attached with  classServer "+classServer.uri)
+
+    }
+    @DeveloperApi
+    def getClassServer = classServer
+
+    @DeveloperApi
+    def getOutputDir = outputDir
+
+    @DeveloperApi
+    def setOutputDir(od : File ) = {
+
+      outputDir=od;
+      echo ("changed outputDir to  "+od)
+
+    }
+
+
 
     /**
      * URI of the class server used to feed REPL compiled classes.
